@@ -4,10 +4,11 @@
 """End-to-end tests for multimodal KV routing with TRT-LLM.
 
 Architecture:
-  Frontend -> MM Router Worker -> TRT-LLM Worker
-                (computes mm_hash)   (publishes KV events)
+  Frontend (KvPushRouter)  -->  TRT-LLM Worker
+   (native mm-routing)          (publishes KV events)
 
-This test validates MM-aware routing by sending repeated multimodal requests and
+The frontend routes natively on the image's mm_hash (no MM router sidecar). This
+test validates MM-aware routing by sending repeated multimodal requests and
 asserting that router overlap is greater than 1 block (regression guard against
 text-only/partially-matched hash paths that typically show 1/N overlap).
 """
@@ -35,7 +36,6 @@ from tests.utils.router_logs import (
 )
 
 TRTLLM_MM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
-TRTLLM_MM_MODEL_TYPE = "qwen3_vl"
 BLOCK_SIZE = 32
 NAMESPACE = "test-mm"
 # Broad guardrails for TRT-LLM + Qwen3-VL-2B under block size 32.
@@ -107,7 +107,7 @@ class TRTLLMWorkerProcess(ManagedProcess):
                 "--model-path",
                 TRTLLM_MM_MODEL,
                 "--served-model-name",
-                f"{TRTLLM_MM_MODEL}__internal",
+                TRTLLM_MM_MODEL,
                 "--endpoint",
                 f"dyn://{NAMESPACE}.trtllm.generate",
                 "--modality",
@@ -131,48 +131,12 @@ class TRTLLMWorkerProcess(ManagedProcess):
         )
 
 
-class TRTLLMMMRouterWorkerProcess(ManagedProcess):
-    """TRT-LLM MM router worker."""
-
-    def __init__(self, request, *, system_port: int):
-        super().__init__(
-            command=[
-                "python3",
-                "-m",
-                "examples.backends.trtllm.mm_router_worker",
-                "--model",
-                TRTLLM_MM_MODEL,
-                "--model-type",
-                TRTLLM_MM_MODEL_TYPE,
-                "--namespace",
-                NAMESPACE,
-                "--component",
-                "mm_router",
-                "--endpoint",
-                "generate",
-                "--downstream-component",
-                "trtllm",
-                "--downstream-endpoint",
-                "generate",
-                "--block-size",
-                str(BLOCK_SIZE),
-            ],
-            env=_make_process_env(
-                DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS='["generate"]',
-                DYN_SYSTEM_PORT=str(system_port),
-            ),
-            health_check_urls=[
-                (f"http://localhost:{system_port}/health", _check_ready)
-            ],
-            timeout=240,
-            straggler_commands=["mm_router_worker"],
-            log_dir=_prepare_log_dir(request, "trtllm-mm-router"),
-            **_COMMON_PROCESS_KWARGS,
-        )
-
-
 class FrontendProcess(ManagedProcess):
-    """Frontend HTTP ingress."""
+    """Frontend HTTP ingress with native KV routing.
+
+    The frontend's KvPushRouter emits the `[ROUTING] ... blocks overlap`
+    records (at debug level) that this test asserts on; no MM router sidecar.
+    """
 
     def __init__(self, request, *, frontend_port: int):
         super().__init__(
@@ -183,9 +147,9 @@ class FrontendProcess(ManagedProcess):
                 "--http-port",
                 str(frontend_port),
                 "--router-mode",
-                "round-robin",
+                "kv",
             ],
-            env=_make_process_env(log_level="info"),
+            env=_make_process_env(),
             health_check_urls=[
                 (f"http://localhost:{frontend_port}/v1/models", check_models_api)
             ],
@@ -210,16 +174,12 @@ def mm_runtime_services(request):
 def start_trtllm_mm_services(
     request, mm_runtime_services
 ) -> Generator[tuple[int, ManagedProcess], None, None]:
-    frontend_port, trtllm_port, router_port = allocate_ports(count=3, start_port=10000)
+    frontend_port, trtllm_port = allocate_ports(count=2, start_port=10000)
 
     with TRTLLMWorkerProcess(request, system_port=trtllm_port):
         time.sleep(15)
-        with TRTLLMMMRouterWorkerProcess(
-            request, system_port=router_port
-        ) as router_proc:
-            time.sleep(5)
-            with FrontendProcess(request, frontend_port=frontend_port):
-                yield frontend_port, router_proc
+        with FrontendProcess(request, frontend_port=frontend_port) as frontend_proc:
+            yield frontend_port, frontend_proc
 
 
 def _make_data_uri(color: tuple[int, int, int], size: int = 1024) -> str:
@@ -248,12 +208,12 @@ def _build_payload(
 
 def _send_request_get_overlap(
     frontend_port: int,
-    router_proc: ManagedProcess,
+    frontend_proc: ManagedProcess,
     payload: dict[str, Any],
     label: str,
 ) -> tuple[int, int, str]:
     """Send one request and read the router's semantic overlap score."""
-    pre_request_logs = router_proc.read_logs()
+    pre_request_logs = frontend_proc.read_logs()
     start_offset = len(pre_request_logs)
     pre_request_record_count = len(extract_router_kv_overlap_records(pre_request_logs))
     resp = requests.post(
@@ -266,7 +226,7 @@ def _send_request_get_overlap(
     assert "choices" in data, f"Missing choices in response: {data}"
 
     overlap, total, recent_logs = wait_for_router_kv_overlap(
-        router_proc.read_logs,
+        frontend_proc.read_logs,
         start_offset=start_offset,
         pre_request_record_count=pre_request_record_count,
         context=label,
@@ -326,7 +286,7 @@ def _check_text_only_overlap_repeated_prompt(
     start_trtllm_mm_services, predownload_models
 ):
     """Text-only routing should increase overlap on repeat and then stabilize."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
 
     prompt = (
         "TEXT routing e2e unique case zeta-7f31. "
@@ -335,13 +295,13 @@ def _check_text_only_overlap_repeated_prompt(
     payload = _build_payload([], prompt=prompt)
 
     overlap_1, total_1, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "text_only_req1"
+        frontend_port, frontend_proc, payload, "text_only_req1"
     )
     overlap_2, total_2, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "text_only_req2"
+        frontend_port, frontend_proc, payload, "text_only_req2"
     )
     overlap_3, total_3, segment_3 = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "text_only_req3"
+        frontend_port, frontend_proc, payload, "text_only_req3"
     )
 
     assert total_1 > 0 and total_2 > 0 and total_3 > 0, (
@@ -370,20 +330,20 @@ def _check_text_only_overlap_repeated_prompt(
 @pytest.mark.nightly
 def _check_repeated_three_images(start_trtllm_mm_services, predownload_models):
     """For repeated same 3-image request: low first overlap, then increase, then stable."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
 
     image_uris = [_make_data_uri(c) for c in _COLORS]
     payload = _build_payload(
         image_uris, prompt="MM routing e2e: repeated same 3-image request."
     )
     overlap_1, total_1, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_3_images_req1"
+        frontend_port, frontend_proc, payload, "same_3_images_req1"
     )
     overlap_2, total_2, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_3_images_req2"
+        frontend_port, frontend_proc, payload, "same_3_images_req2"
     )
     overlap_3, total_3, segment_3 = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_3_images_req3"
+        frontend_port, frontend_proc, payload, "same_3_images_req3"
     )
 
     assert overlap_1 <= 1, (
@@ -411,20 +371,20 @@ def _check_repeated_three_images(start_trtllm_mm_services, predownload_models):
 @pytest.mark.nightly
 def _check_repeated_single_image(start_trtllm_mm_services, predownload_models):
     """For repeated same single-image request: low first overlap, then increase, then stable."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
 
     payload = _build_payload(
         [_make_data_uri(_SINGLE_IMAGE_FRESH_COLOR)],
         prompt="MM routing e2e: repeated same single-image request.",
     )
     overlap_1, total_1, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_single_image_req1"
+        frontend_port, frontend_proc, payload, "same_single_image_req1"
     )
     overlap_2, total_2, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_single_image_req2"
+        frontend_port, frontend_proc, payload, "same_single_image_req2"
     )
     overlap_3, total_3, segment_3 = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_single_image_req3"
+        frontend_port, frontend_proc, payload, "same_single_image_req3"
     )
 
     assert overlap_1 <= 1, (
@@ -452,7 +412,7 @@ def _check_repeated_single_image(start_trtllm_mm_services, predownload_models):
 @pytest.mark.nightly
 def _check_repeated_two_identical_images(start_trtllm_mm_services, predownload_models):
     """For repeated same two-identical-image request: low first overlap, then increase, then stable."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
 
     image_uri = _make_data_uri(_DOUBLE_IMAGE_FRESH_COLOR)
     payload = _build_payload(
@@ -460,15 +420,15 @@ def _check_repeated_two_identical_images(start_trtllm_mm_services, predownload_m
         prompt="MM routing e2e: repeated same two-identical-image request.",
     )
     overlap_1, total_1, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_two_identical_images_req1"
+        frontend_port, frontend_proc, payload, "same_two_identical_images_req1"
     )
     time.sleep(1)
     overlap_2, total_2, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_two_identical_images_req2"
+        frontend_port, frontend_proc, payload, "same_two_identical_images_req2"
     )
     time.sleep(1)
     overlap_3, total_3, segment_3 = _send_request_get_overlap(
-        frontend_port, router_proc, payload, "same_two_identical_images_req3"
+        frontend_port, frontend_proc, payload, "same_two_identical_images_req3"
     )
 
     assert overlap_1 <= 1, (
@@ -493,7 +453,7 @@ def _check_staircase_single_to_double_to_triple_identical_image(
     start_trtllm_mm_services, predownload_models
 ):
     """Single->double->triple identical image requests follow prefix-overlap semantics."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
 
     image_uri = _make_data_uri(_STAIRCASE_IMAGE_FRESH_COLOR)
     staircase_prompt = "MM routing e2e: staircase."
@@ -504,14 +464,14 @@ def _check_staircase_single_to_double_to_triple_identical_image(
     )
 
     overlap_1, total_1, _ = _send_request_get_overlap(
-        frontend_port, router_proc, payload_single, "staircase_1x_image"
+        frontend_port, frontend_proc, payload_single, "staircase_1x_image"
     )
     overlap_2, total_2, segment_2 = _send_request_get_overlap(
-        frontend_port, router_proc, payload_double, "staircase_2x_image"
+        frontend_port, frontend_proc, payload_double, "staircase_2x_image"
     )
     time.sleep(1)
     overlap_3, total_3, segment_3 = _send_request_get_overlap(
-        frontend_port, router_proc, payload_triple, "staircase_3x_image"
+        frontend_port, frontend_proc, payload_triple, "staircase_3x_image"
     )
 
     assert overlap_2 > overlap_1, (
@@ -546,16 +506,16 @@ def _check_staircase_single_to_double_to_triple_identical_image(
 @pytest.mark.nightly
 def _check_diff_images_less_than_same(start_trtllm_mm_services, predownload_models):
     """Different images should produce lower overlap than repeated identical images."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
     baseline_payload = _build_payload(
         [_make_data_uri(c) for c in _COLORS],
         prompt="MM routing e2e: baseline same-images overlap.",
     )
     overlap_baseline_1, total_baseline_1, _ = _send_request_get_overlap(
-        frontend_port, router_proc, baseline_payload, "baseline_same_images_req1"
+        frontend_port, frontend_proc, baseline_payload, "baseline_same_images_req1"
     )
     overlap_baseline_2, total_baseline_2, segment_baseline = _send_request_get_overlap(
-        frontend_port, router_proc, baseline_payload, "baseline_same_images_req2"
+        frontend_port, frontend_proc, baseline_payload, "baseline_same_images_req2"
     )
     overlap_baseline = max(overlap_baseline_1, overlap_baseline_2)
     total_baseline = total_baseline_2
@@ -579,7 +539,7 @@ def _check_diff_images_less_than_same(start_trtllm_mm_services, predownload_mode
         prompt="MM routing e2e: baseline same-images overlap.",
     )
     overlap_probe, total_probe, segment_probe = _send_request_get_overlap(
-        frontend_port, router_proc, probe_payload, "probe_different_images_req1"
+        frontend_port, frontend_proc, probe_payload, "probe_different_images_req1"
     )
     assert (
         total_probe > 0
@@ -602,20 +562,20 @@ def _check_same_images_different_prompt_less_than_same_prompt(
     start_trtllm_mm_services, predownload_models
 ):
     """Same images but different prompt should produce lower overlap than repeated same prompt."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
     baseline_payload = _build_payload(
         [_make_data_uri(c) for c in _COLORS],
         prompt="MM routing e2e: prompt-sensitive baseline alpha.",
     )
     overlap_baseline_1, total_baseline_1, _ = _send_request_get_overlap(
         frontend_port,
-        router_proc,
+        frontend_proc,
         baseline_payload,
         "baseline_same_images_prompt_a_req1",
     )
     overlap_baseline_2, total_baseline_2, segment_baseline = _send_request_get_overlap(
         frontend_port,
-        router_proc,
+        frontend_proc,
         baseline_payload,
         "baseline_same_images_prompt_a_req2",
     )
@@ -641,7 +601,7 @@ def _check_same_images_different_prompt_less_than_same_prompt(
         prompt="MM routing e2e: prompt-sensitive baseline omega.",
     )
     overlap_probe, total_probe, segment_probe = _send_request_get_overlap(
-        frontend_port, router_proc, probe_payload, "probe_same_images_prompt_b_req1"
+        frontend_port, frontend_proc, probe_payload, "probe_same_images_prompt_b_req1"
     )
     assert (
         total_probe > 0
@@ -664,7 +624,7 @@ def _check_swapped_order_less_than_same_order(
     start_trtllm_mm_services, predownload_models
 ):
     """Swapping order of three distinct images should result in near-zero overlap."""
-    frontend_port, router_proc = start_trtllm_mm_services
+    frontend_port, frontend_proc = start_trtllm_mm_services
     ordered_uris = [_make_data_uri(c) for c in _SWAP_ORDER_FRESH_COLORS]
     ordered_payload = _build_payload(
         ordered_uris, prompt="MM routing e2e: order sensitivity ordered baseline."
@@ -676,19 +636,19 @@ def _check_swapped_order_less_than_same_order(
 
     overlap_ordered_1, total_ordered_1, _ = _send_request_get_overlap(
         frontend_port,
-        router_proc,
+        frontend_proc,
         ordered_payload,
         "ordered_distinct_images_req1",
     )
     overlap_ordered_2, total_ordered_2, segment_ordered_2 = _send_request_get_overlap(
         frontend_port,
-        router_proc,
+        frontend_proc,
         ordered_payload,
         "ordered_distinct_images_req2",
     )
     overlap_swapped, total_swapped, segment_swapped = _send_request_get_overlap(
         frontend_port,
-        router_proc,
+        frontend_proc,
         swapped_payload,
         "swapped_distinct_images_req1",
     )

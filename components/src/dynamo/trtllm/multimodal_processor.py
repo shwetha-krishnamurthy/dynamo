@@ -432,6 +432,19 @@ class MultimodalRequestProcessor:
             if processed_mm_data:
                 processed_inputs["multi_modal_data"] = processed_mm_data
 
+                # Forward the frontend's per-image routing hashes as TRT-LLM
+                # multi_modal_uuids so KV-reuse events carry the same image
+                # identity the KV router placed the request on. Absent or
+                # mismatched hashes leave TRT-LLM to compute its own.
+                images = processed_mm_data.get("image")
+                mm_hashes = extra_args.get("mm_hashes")
+                if (
+                    images
+                    and isinstance(mm_hashes, list)
+                    and len(mm_hashes) == len(images)
+                ):
+                    processed_inputs["multi_modal_uuids"] = {"image": list(mm_hashes)}
+
         # Get token_ids from request (already tokenized by Rust frontend)
         token_ids = request.get("token_ids")
         if not token_ids:

@@ -949,6 +949,7 @@ pub(crate) struct KvEventPublisher {
     kv_block_size: usize,
     dp_rank: DpRank,
     warning_count: Arc<AtomicU32>,
+    image_token_id: Option<u32>,
 }
 
 impl KvEventPublisher {
@@ -968,6 +969,11 @@ impl KvEventPublisher {
             kv_block_size,
             dp_rank,
             warning_count: Arc::new(AtomicU32::new(0)),
+            // None: this bridge is unified-backend only, which this PR does not
+            // wire for TRT-LLM multimodal. MM runs on the non-unified path, where
+            // the `KvEventPublisher` constructor sets the marker. Thread it here
+            // if/when MM moves to the unified backend.
+            image_token_id: None,
         }
     }
 }
@@ -1038,6 +1044,7 @@ impl KvEventPublisher {
             kv_block_size,
             dp_rank,
             warning_count: Arc::new(AtomicU32::new(0)),
+            image_token_id,
         })
     }
 
@@ -1059,6 +1066,7 @@ impl KvEventPublisher {
         let dp_rank = self.dp_rank;
         let warning_count = self.warning_count.clone();
         let inner = self.inner.clone();
+        let image_token_id = self.image_token_id;
 
         let event_id = inner.next_event_id();
 
@@ -1084,7 +1092,7 @@ impl KvEventPublisher {
                         &warning_count,
                         mm_infos.as_deref(),
                         is_eagle,
-                        None, // image_token_id: publish path keeps caller-supplied mm_infos
+                        image_token_id, // normalize image-token runs to pad_value when a marker is configured
                     ),
                 }),
                 dp_rank,
