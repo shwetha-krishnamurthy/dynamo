@@ -63,6 +63,8 @@ def _register_model_source_path(
     the Rust-side HF download entirely (lib/bindings/python/rust/lib.rs:314)
     and don't need this rewrite.
     """
+    if engine is None:
+        return server_args.model_path
     try:
         mc = engine.tokenizer_manager.model_config
     except AttributeError:
@@ -414,14 +416,15 @@ async def _get_runtime_config(
     # Set topology and KV transfer policy for topology-aware routing
     apply_topology_config(runtime_config)
 
-    # Set bootstrap endpoint for disaggregated serving (prefill workers)
-    bootstrap_host, bootstrap_port = _get_bootstrap_info_for_config(engine)
-    if bootstrap_host and bootstrap_port:
-        runtime_config.set_disaggregated_endpoint(bootstrap_host, bootstrap_port)
-        logging.info(
-            f"Publishing disaggregated endpoint to discovery: "
-            f"{bootstrap_host}:{bootstrap_port}"
-        )
+    if engine is not None:
+        # Set bootstrap endpoint for disaggregated serving (prefill workers)
+        bootstrap_host, bootstrap_port = _get_bootstrap_info_for_config(engine)
+        if bootstrap_host and bootstrap_port:
+            runtime_config.set_disaggregated_endpoint(bootstrap_host, bootstrap_port)
+            logging.info(
+                f"Publishing disaggregated endpoint to discovery: "
+                f"{bootstrap_host}:{bootstrap_port}"
+            )
     # In SGLang, these are server_args, not scheduler_info (unlike vLLM)
     # Note: If --max-running-requests is not specified, SGLang uses an internal default
     # undocumented value. The value here will be None if not explicitly set by user.
@@ -462,6 +465,11 @@ async def _get_runtime_config(
             logging.warning(
                 f"Failed to attach Mooncake HiCache runtime metadata to registration: {e}"
             )
+
+    # Encode/proxy workers intentionally have no SGLang engine. All remaining
+    # metadata depends on scheduler state, so their configuration is complete.
+    if engine is None:
+        return runtime_config
 
     try:
         scheduler_info = engine._scheduler_init_result.scheduler_infos[0]

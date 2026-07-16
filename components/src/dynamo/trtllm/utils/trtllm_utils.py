@@ -81,11 +81,12 @@ def get_spec_decode_runtime_data(engine_args: Any) -> dict[str, Any] | None:
 
 def engine_max_num_seqs(engine: Any) -> int | None:
     """Return TRT-LLM's post-initialization, engine-wide request capacity."""
-    value = getattr(
-        getattr(getattr(engine, "llm", None), "args", None),
-        "max_batch_size",
-        None,
-    )
+    value = engine.llm.args.max_batch_size
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         return None
     return value
+
+
+def populate_engine_max_num_seqs(runtime_config: Any, engine: Any) -> None:
+    """Publish TRT-LLM's post-initialization capacity on its registration."""
+    runtime_config.engine_max_num_seqs = engine_max_num_seqs(engine)

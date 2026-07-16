@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -80,7 +80,54 @@ async def test_engine_sequence_capacity_returns_none_without_usable_limit():
 
 
 @pytest.mark.asyncio
-async def test_proxy_registration_does_not_report_local_engine_capacity(monkeypatch):
+async def test_registration_reports_resolved_local_engine_capacity(monkeypatch):
+    # Keep this backend-heavy import lazy: importing it at module scope breaks
+    # the sglang-light `pytest-marker-report` collection environment.
+    from dynamo.sglang import register
+
+    engine = SimpleNamespace(
+        _scheduler_init_result=SimpleNamespace(scheduler_infos=[{}]),
+    )
+    server_args = SimpleNamespace(
+        context_length=4096,
+        disaggregation_mode=None,
+        max_prefill_tokens=None,
+        page_size=16,
+        speculative_algorithm="NONE",
+    )
+    dynamo_args = register.DynamoConfig()
+    dynamo_args.enable_local_indexer = False
+    resolver = AsyncMock(return_value=15)
+    capacity = SimpleNamespace(
+        max_num_seqs=None,
+        max_num_batched_tokens=None,
+        total_kv_blocks=None,
+    )
+
+    monkeypatch.setattr(register, "resolve_engine_max_num_seqs", resolver)
+    monkeypatch.setattr(register, "model_card_dp_rank_bounds", lambda _: (2, 5))
+    monkeypatch.setattr(register, "get_sglang_worker_group_id", lambda _: None)
+    monkeypatch.setattr(
+        register, "_get_bootstrap_info_for_config", lambda _: (None, None)
+    )
+    monkeypatch.setattr(register, "_get_mooncake_runtime_data", lambda _: None)
+    monkeypatch.setattr(register, "runtime_capacity", lambda *_: capacity)
+
+    runtime_config = await register._get_runtime_config(
+        engine, server_args, dynamo_args
+    )
+
+    resolver.assert_awaited_once_with(engine, server_args, 3)
+    assert runtime_config.engine_max_num_seqs == 15
+
+
+@pytest.mark.asyncio
+async def test_proxy_registration_does_not_report_local_engine_capacity(
+    monkeypatch, caplog
+):
+    # Keep this backend-heavy import lazy: register.py imports
+    # sglang.srt.environ.envs, which is unavailable to the
+    # `pytest-marker-report` collection environment.
     from dynamo.sglang import register
 
     server_args = SimpleNamespace(
@@ -93,6 +140,8 @@ async def test_proxy_registration_does_not_report_local_engine_capacity(monkeypa
     dynamo_args = register.DynamoConfig()
     dynamo_args.enable_local_indexer = False
     resolver = AsyncMock(return_value=99)
+    bootstrap_resolver = Mock(return_value=(None, None))
+    offloading_resolver = Mock(return_value=None)
     capacity = SimpleNamespace(
         max_num_seqs=None,
         max_num_batched_tokens=None,
@@ -102,16 +151,22 @@ async def test_proxy_registration_does_not_report_local_engine_capacity(monkeypa
     monkeypatch.setattr(register, "resolve_engine_max_num_seqs", resolver)
     monkeypatch.setattr(register, "model_card_dp_rank_bounds", lambda _: (0, 1))
     monkeypatch.setattr(register, "get_sglang_worker_group_id", lambda _: None)
-    monkeypatch.setattr(
-        register, "_get_bootstrap_info_for_config", lambda _: (None, None)
-    )
+    monkeypatch.setattr(register, "_get_bootstrap_info_for_config", bootstrap_resolver)
     monkeypatch.setattr(register, "_get_mooncake_runtime_data", lambda _: None)
     monkeypatch.setattr(register, "runtime_capacity", lambda *_: capacity)
+    monkeypatch.setattr(
+        register, "get_hicache_native_offloading_capacity", offloading_resolver
+    )
 
     runtime_config = await register._get_runtime_config(None, server_args, dynamo_args)
 
     resolver.assert_not_awaited()
+    bootstrap_resolver.assert_not_called()
+    offloading_resolver.assert_not_called()
     assert runtime_config.engine_max_num_seqs is None
+    assert runtime_config.context_length == 4096
+    assert "Failed to get runtime config" not in caplog.text
+    assert "Failed to compute bootstrap address" not in caplog.text
 
 
 def test_spec_decode_runtime_data_uses_speculative_num_steps():

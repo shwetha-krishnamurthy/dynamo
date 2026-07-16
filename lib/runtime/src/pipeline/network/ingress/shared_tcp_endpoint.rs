@@ -14,7 +14,7 @@ use crate::metrics::work_handler_pool::{
     WORK_HANDLER_QUEUE_DEPTH,
 };
 use crate::pipeline::network::PushWorkHandler;
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -36,12 +36,28 @@ const DEFAULT_WORKER_POOL_SIZE: usize = 10000;
 /// this is a small overflow queue to handle burst traffic
 const DEFAULT_WORK_QUEUE_SIZE: usize = 16;
 
-/// Get work queue size from environment or use default
-fn get_work_queue_size() -> usize {
-    std::env::var("DYN_TCP_WORK_QUEUE_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_WORK_QUEUE_SIZE)
+fn parse_env_usize_value(name: &str, raw_value: &str) -> Result<usize> {
+    raw_value
+        .parse::<usize>()
+        .map_err(|_| anyhow!("{name} must be a positive integer, got {raw_value:?}"))
+}
+
+fn parse_env_usize(name: &str) -> Result<Option<usize>> {
+    match std::env::var(name) {
+        Ok(raw_value) => parse_env_usize_value(name, &raw_value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow!("failed to read {name}: {error}")),
+    }
+}
+
+fn validate_tokio_capacity(name: &str, value: usize, minimum: usize) -> Result<usize> {
+    if value < minimum || value > Semaphore::MAX_PERMITS {
+        bail!(
+            "{name} must be between {minimum} and {}, got {value}",
+            Semaphore::MAX_PERMITS
+        );
+    }
+    Ok(value)
 }
 
 /// Default small overflow queue when the engine-request limit is set but the
@@ -59,34 +75,37 @@ const DEFAULT_DYNAMO_REQUEST_QUEUE_LIMIT: usize = 16;
 /// * otherwise `DYN_TCP_WORKER_POOL_SIZE` set → explicit pool and TCP queue.
 /// * otherwise a reported `engine_max_num_seqs` sizes the pool at 1.5x.
 /// * otherwise the pool falls back to 10000. The TCP queue defaults to 16.
+#[derive(Debug)]
 struct SizingConfig {
     pool_size: usize,
     queue_size: usize,
 }
 
-fn resolve_sizing(engine_max_num_seqs: Option<usize>) -> SizingConfig {
-    match std::env::var("DYN_ENGINE_REQUEST_LIMIT")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
+fn resolve_sizing(
+    engine_max_num_seqs: Option<usize>,
+    env: impl Fn(&str) -> Result<Option<usize>>,
+) -> Result<SizingConfig> {
+    let read_capacity = |name: &str, minimum: usize| {
+        env(name)?
+            .map(|value| validate_tokio_capacity(name, value, minimum))
+            .transpose()
+    };
+
+    let sizing = match read_capacity("DYN_ENGINE_REQUEST_LIMIT", 1)? {
         Some(engine_limit) => {
-            let queue_limit = std::env::var("DYN_DYNAMO_REQUEST_QUEUE_LIMIT")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
+            let queue_limit = read_capacity("DYN_DYNAMO_REQUEST_QUEUE_LIMIT", 2)?
                 .unwrap_or(DEFAULT_DYNAMO_REQUEST_QUEUE_LIMIT);
             // The single dispatcher holds one request between `recv()` and
             // acquiring an engine permit, so size the channel to limit-1:
             // channel + the dispatcher-held request cap "queued, not in engine"
             // at exactly `limit`.
             SizingConfig {
-                pool_size: engine_limit.max(1),
-                queue_size: queue_limit.saturating_sub(1).max(1),
+                pool_size: engine_limit,
+                queue_size: queue_limit - 1,
             }
         }
         None => {
-            let pool_size = std::env::var("DYN_TCP_WORKER_POOL_SIZE")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
+            let pool_size = read_capacity("DYN_TCP_WORKER_POOL_SIZE", 1)?
                 .or_else(|| {
                     engine_max_num_seqs
                         .filter(|capacity| *capacity > 0)
@@ -99,10 +118,12 @@ fn resolve_sizing(engine_max_num_seqs: Option<usize>) -> SizingConfig {
                 .unwrap_or(DEFAULT_WORKER_POOL_SIZE);
             SizingConfig {
                 pool_size,
-                queue_size: get_work_queue_size(),
+                queue_size: read_capacity("DYN_TCP_WORK_QUEUE_SIZE", 1)?
+                    .unwrap_or(DEFAULT_WORK_QUEUE_SIZE),
             }
         }
-    }
+    };
+    Ok(sizing)
 }
 
 /// RAII guard for `WORK_HANDLER_POOL_ACTIVE_TASKS`. `new()` increments and
@@ -176,11 +197,20 @@ impl SharedTcpServer {
         bind_addr: SocketAddr,
         cancellation_token: CancellationToken,
         engine_max_num_seqs: Option<usize>,
+    ) -> Result<Arc<Self>> {
+        let sizing = resolve_sizing(engine_max_num_seqs, parse_env_usize)?;
+        Ok(Self::new_with_sizing(bind_addr, cancellation_token, sizing))
+    }
+
+    fn new_with_sizing(
+        bind_addr: SocketAddr,
+        cancellation_token: CancellationToken,
+        sizing: SizingConfig,
     ) -> Arc<Self> {
         let SizingConfig {
             pool_size: worker_pool_size,
             queue_size: work_queue_size,
-        } = resolve_sizing(engine_max_num_seqs);
+        } = sizing;
 
         tracing::info!(
             "Initializing TCP server with dispatcher (concurrency={}, queue={})",
@@ -782,50 +812,114 @@ mod tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
+    fn sizing_env<const N: usize>(
+        values: [(&'static str, usize); N],
+    ) -> impl Fn(&str) -> Result<Option<usize>> {
+        move |name| {
+            Ok(values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then_some(*value)))
+        }
+    }
+
+    fn assert_sizing_error<const N: usize>(
+        values: [(&'static str, usize); N],
+        expected_name: &str,
+    ) {
+        let error = resolve_sizing(None, sizing_env(values))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(expected_name),
+            "error did not name {expected_name}: {error}"
+        );
+    }
+
     #[test]
     fn worker_pool_size_precedence() {
-        temp_env::with_vars(
-            [
-                ("DYN_ENGINE_REQUEST_LIMIT", Some("7")),
-                ("DYN_DYNAMO_REQUEST_QUEUE_LIMIT", Some("5")),
-                ("DYN_TCP_WORKER_POOL_SIZE", Some("99")),
-                ("DYN_TCP_WORK_QUEUE_SIZE", Some("123")),
-            ],
-            || {
-                let sizing = resolve_sizing(Some(20));
-                assert_eq!(sizing.pool_size, 7);
-                assert_eq!(sizing.queue_size, 4);
-            },
-        );
+        // Each case supplies an immutable environment view, so this test is
+        // independent from process-global state and other parallel tests.
+        let sizing = resolve_sizing(
+            Some(20),
+            sizing_env([
+                ("DYN_ENGINE_REQUEST_LIMIT", 7),
+                ("DYN_DYNAMO_REQUEST_QUEUE_LIMIT", 5),
+                ("DYN_TCP_WORKER_POOL_SIZE", 99),
+                ("DYN_TCP_WORK_QUEUE_SIZE", 123),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(sizing.pool_size, 7);
+        assert_eq!(sizing.queue_size, 4);
 
-        temp_env::with_vars(
-            [
-                ("DYN_ENGINE_REQUEST_LIMIT", None),
-                ("DYN_DYNAMO_REQUEST_QUEUE_LIMIT", None),
-                ("DYN_TCP_WORKER_POOL_SIZE", Some("99")),
-                ("DYN_TCP_WORK_QUEUE_SIZE", Some("123")),
-            ],
-            || {
-                let sizing = resolve_sizing(Some(20));
-                assert_eq!(sizing.pool_size, 99);
-                assert_eq!(sizing.queue_size, 123);
-            },
-        );
+        let sizing = resolve_sizing(
+            Some(20),
+            sizing_env([
+                ("DYN_TCP_WORKER_POOL_SIZE", 99),
+                ("DYN_TCP_WORK_QUEUE_SIZE", 123),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(sizing.pool_size, 99);
+        assert_eq!(sizing.queue_size, 123);
 
-        temp_env::with_vars_unset(
-            [
+        let sizing =
+            resolve_sizing(Some(20), sizing_env([("DYN_ENGINE_REQUEST_LIMIT", 7)])).unwrap();
+        assert_eq!(sizing.pool_size, 7);
+        // The logical default is 16 queued requests: 15 in the
+        // channel plus one held by the dispatcher.
+        assert_eq!(sizing.queue_size, 15);
+        assert_eq!(sizing.queue_size + 1, 16);
+
+        assert_eq!(resolve_sizing(Some(3), |_| Ok(None)).unwrap().pool_size, 5);
+        assert_eq!(resolve_sizing(Some(8), |_| Ok(None)).unwrap().pool_size, 12);
+        let fallback = resolve_sizing(None, |_| Ok(None)).unwrap();
+        assert_eq!(fallback.pool_size, 10_000);
+        assert_eq!(fallback.queue_size, 16);
+    }
+
+    #[test]
+    fn worker_pool_sizing_rejects_invalid_capacities() {
+        let too_large = Semaphore::MAX_PERMITS + 1;
+
+        for value in [0, too_large] {
+            assert_sizing_error(
+                [("DYN_ENGINE_REQUEST_LIMIT", value)],
                 "DYN_ENGINE_REQUEST_LIMIT",
+            );
+            assert_sizing_error(
+                [
+                    ("DYN_ENGINE_REQUEST_LIMIT", 1),
+                    ("DYN_DYNAMO_REQUEST_QUEUE_LIMIT", value),
+                ],
                 "DYN_DYNAMO_REQUEST_QUEUE_LIMIT",
+            );
+            assert_sizing_error(
+                [("DYN_TCP_WORKER_POOL_SIZE", value)],
                 "DYN_TCP_WORKER_POOL_SIZE",
+            );
+            assert_sizing_error(
+                [("DYN_TCP_WORK_QUEUE_SIZE", value)],
                 "DYN_TCP_WORK_QUEUE_SIZE",
+            );
+        }
+
+        assert_sizing_error(
+            [
+                ("DYN_ENGINE_REQUEST_LIMIT", 1),
+                ("DYN_DYNAMO_REQUEST_QUEUE_LIMIT", 1),
             ],
-            || {
-                assert_eq!(resolve_sizing(Some(3)).pool_size, 5);
-                assert_eq!(resolve_sizing(Some(8)).pool_size, 12);
-                assert_eq!(resolve_sizing(None).pool_size, DEFAULT_WORKER_POOL_SIZE);
-                assert_eq!(resolve_sizing(None).queue_size, DEFAULT_WORK_QUEUE_SIZE);
-            },
+            "DYN_DYNAMO_REQUEST_QUEUE_LIMIT",
         );
+    }
+
+    #[test]
+    fn worker_pool_sizing_rejects_malformed_capacity() {
+        let error = parse_env_usize_value("DYN_TCP_WORKER_POOL_SIZE", "not-a-number")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("DYN_TCP_WORKER_POOL_SIZE"));
+        assert!(error.contains("not-a-number"));
     }
 
     /// Mock handler that simulates slow request processing for testing
@@ -894,7 +988,14 @@ mod tests {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         // Create SharedTcpServer
-        let server = SharedTcpServer::new(bind_addr, cancellation_token.clone(), None);
+        let server = SharedTcpServer::new_with_sizing(
+            bind_addr,
+            cancellation_token.clone(),
+            SizingConfig {
+                pool_size: 10_000,
+                queue_size: 16,
+            },
+        );
 
         // Create a handler that takes 1s to process requests
         let handler = Arc::new(SlowMockHandler::new(Duration::from_secs(1)));
@@ -1241,20 +1342,15 @@ mod tests {
     async fn test_capacities_published_on_server_init() {
         crate::logging::init();
 
-        // SharedTcpServer::new publishes static capacities. Any test that instantiates
-        // a SharedTcpServer will have populated the gauges; we just assert they're > 0.
+        // SharedTcpServer::new publishes the resolved static capacities. Pin
+        // the numeric defaults rather than comparing against production constants.
         let cancellation_token = CancellationToken::new();
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let _server = SharedTcpServer::new(bind_addr, cancellation_token.clone(), None);
-
-        assert!(
-            WORK_HANDLER_POOL_CAPACITY.get() > 0,
-            "pool_capacity should be set to DEFAULT_WORKER_POOL_SIZE"
-        );
-        assert!(
-            WORK_HANDLER_QUEUE_CAPACITY.get() > 0,
-            "queue_capacity should be set to DEFAULT_WORK_QUEUE_SIZE"
-        );
+        let sizing = resolve_sizing(None, |_| Ok(None)).unwrap();
+        let _server =
+            SharedTcpServer::new_with_sizing(bind_addr, cancellation_token.clone(), sizing);
+        assert_eq!(WORK_HANDLER_POOL_CAPACITY.get(), 10_000);
+        assert_eq!(WORK_HANDLER_QUEUE_CAPACITY.get(), 16);
         cancellation_token.cancel();
     }
 }

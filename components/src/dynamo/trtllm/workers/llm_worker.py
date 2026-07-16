@@ -67,8 +67,8 @@ from dynamo.trtllm.request_handlers.handlers import (
 )
 from dynamo.trtllm.utils.trtllm_utils import (
     deep_update,
-    engine_max_num_seqs,
     get_spec_decode_runtime_data,
+    populate_engine_max_num_seqs,
 )
 
 # Default buffer size for kv cache events.
@@ -552,7 +552,7 @@ async def init_llm_worker(
         # Need to get max_num_seqs and max_num_batched_tokens from engine_args
         # because they can be overridden by --extra-engine-args or --override-engine-args
         runtime_config.max_num_seqs = engine_args["max_batch_size"]
-        runtime_config.engine_max_num_seqs = engine_max_num_seqs(engine)
+        populate_engine_max_num_seqs(runtime_config, engine)
         runtime_config.max_num_batched_tokens = engine_args["max_num_tokens"]
         runtime_config.reasoning_parser = config.dyn_reasoning_parser
         runtime_config.tool_call_parser = config.dyn_tool_call_parser

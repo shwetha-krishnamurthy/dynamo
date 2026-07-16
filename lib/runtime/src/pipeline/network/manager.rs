@@ -297,7 +297,7 @@ impl NetworkManager {
                     bind_addr,
                     GLOBAL_TCP_SERVER_TOKEN.clone(),
                     engine_max_num_seqs,
-                );
+                )?;
 
                 // Bind and start server, getting the actual bound address
                 let actual_addr = server.clone().bind_and_start().await?;

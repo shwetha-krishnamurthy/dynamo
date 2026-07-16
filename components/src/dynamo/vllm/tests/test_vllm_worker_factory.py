@@ -49,7 +49,9 @@ def _make_config(**overrides) -> Mock:
 
 
 @pytest.mark.asyncio
-async def test_embedding_registers_capacity_before_serving_endpoint(monkeypatch):
+async def test_embedding_registers_capacity_before_serving_endpoint(
+    monkeypatch, tmp_path
+):
     registration_started = asyncio.Event()
     registration_release = asyncio.Event()
     serve_started = asyncio.Event()
@@ -74,7 +76,7 @@ async def test_embedding_registers_capacity_before_serving_endpoint(monkeypatch)
         engine_client,
         vllm_config,
         Mock(),
-        "/tmp/prom",
+        str(tmp_path / "prom"),
         Mock(),
     )
     factory = WorkerFactory(

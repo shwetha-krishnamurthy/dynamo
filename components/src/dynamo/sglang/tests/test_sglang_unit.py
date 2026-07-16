@@ -10,6 +10,7 @@ import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -69,8 +70,9 @@ mock_sglang_cli = make_cli_args_fixture("dynamo.sglang")
 
 @pytest.mark.asyncio
 async def test_decode_registers_capacity_before_serving_endpoints(monkeypatch):
-    from unittest.mock import AsyncMock, Mock
-
+    # Keep this backend-heavy import lazy: init_llm transitively imports
+    # register.py, whose sglang.srt.environ.envs import is unavailable to the
+    # `pytest-marker-report` collection environment.
     from dynamo.sglang import init_llm
 
     registration_started = asyncio.Event()

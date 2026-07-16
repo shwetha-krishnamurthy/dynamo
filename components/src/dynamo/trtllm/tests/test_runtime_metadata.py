@@ -5,9 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from dynamo.llm import ModelRuntimeConfig
 from dynamo.trtllm.utils.trtllm_utils import (
     engine_max_num_seqs,
     get_spec_decode_runtime_data,
+    populate_engine_max_num_seqs,
 )
 
 pytestmark = [
@@ -20,10 +22,24 @@ pytestmark = [
 
 def test_engine_max_num_seqs_uses_post_init_engine_value():
     engine = SimpleNamespace(
-        llm=SimpleNamespace(args=SimpleNamespace(max_batch_size=37))
+        llm=SimpleNamespace(args=SimpleNamespace(max_batch_size=37)),
+        get_attention_dp_size=lambda: 4,
     )
 
+    # TRT-LLM reports one engine-wide budget; attention DP must not multiply it.
     assert engine_max_num_seqs(engine) == 37
+
+
+def test_registration_reports_post_init_engine_capacity():
+    runtime_config = ModelRuntimeConfig()
+    engine = SimpleNamespace(
+        llm=SimpleNamespace(args=SimpleNamespace(max_batch_size=37)),
+        get_attention_dp_size=lambda: 4,
+    )
+
+    populate_engine_max_num_seqs(runtime_config, engine)
+
+    assert runtime_config.engine_max_num_seqs == 37
 
 
 @pytest.mark.parametrize("value", [None, 0, -1, True, "37"])
@@ -33,6 +49,11 @@ def test_engine_max_num_seqs_ignores_invalid_values(value):
     )
 
     assert engine_max_num_seqs(engine) is None
+
+
+def test_engine_max_num_seqs_fails_if_engine_contract_changes():
+    with pytest.raises(AttributeError):
+        engine_max_num_seqs(SimpleNamespace())
 
 
 def test_spec_decode_runtime_data_uses_max_draft_len():
