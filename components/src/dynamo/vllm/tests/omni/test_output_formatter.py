@@ -234,6 +234,36 @@ class TestDiffusionFormatterVideo:
         assert chunk["status"] == "failed"
         assert "boom" in chunk["error"]
 
+    @pytest.mark.asyncio
+    async def test_float_frames_coerced_to_uint8(self):
+        # encode_to_video_bytes/imageio need uint8; float frames must be scaled.
+        import numpy as np
+        from unittest.mock import patch
+
+        f = _make_diffusion_formatter()
+        captured = {}
+
+        def _capture(frames, *args, **kwargs):
+            captured["frames"] = frames
+            return b"mp4-bytes"
+
+        with (
+            patch(
+                "dynamo.vllm.omni.output_formatter.normalize_video_frames",
+                return_value=np.full((2, 4, 4, 3), 0.5, dtype=np.float32),
+            ),
+            patch(
+                "dynamo.vllm.omni.output_formatter.encode_to_video_bytes",
+                side_effect=_capture,
+            ),
+        ):
+            chunk = await f._encode_video(
+                [MagicMock()], "req-1", fps=16, response_format="b64_json"
+            )
+        assert chunk["status"] == "completed"
+        assert captured["frames"].dtype == np.uint8
+        assert int(captured["frames"].max()) <= 255
+
 
 class TestBuildCompletionUsage:
     def test_basic(self):

@@ -4,10 +4,11 @@
 # Third-party Python dependencies for the vllm runtime image. Installed
 # with --reinstall-package imageio-ffmpeg --no-deps to replace the upstream
 # vllm/vllm-openai base image's imageio-ffmpeg wheel (which ships a
-# GPL-encumbered prebuilt ffmpeg binary) with a source build that leaves
-# no binary on disk. vLLM-Omni uses diffusers.export_to_video and doesn't
-# invoke imageio-ffmpeg, so no IMAGEIO_FFMPEG_EXE is needed — this is
-# purely to clear the GPL binary.
+# prebuilt ffmpeg binary) with a source build that leaves no binary on disk.
+# vLLM-Omni encodes video via imageio (codec="h264_nvenc", see
+# common/utils/video_utils.py), which shells out to the ffmpeg referenced by
+# IMAGEIO_FFMPEG_EXE (set in vllm_runtime.Dockerfile). This --reinstall replaces
+# that prebuilt binary so imageio uses the in-tree ffmpeg.
 
 --no-binary imageio-ffmpeg
 
