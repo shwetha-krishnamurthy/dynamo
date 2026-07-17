@@ -34,9 +34,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::epp_standalone_config::EppStandaloneConfig;
 
-/// Tenant scope for standalone mode. Must match between worker registration and
+/// Routing group for standalone mode. Must match between worker registration and
 /// selection; the selection service's own default is `"default"`.
-const DEFAULT_TENANT: &str = "default";
+const DEFAULT_ROUTING_GROUP: &str = "default";
 
 /// A worker the EPP registers into the selector. Only the fields standalone
 /// mode populates are included; the selector defaults the rest.
@@ -46,7 +46,6 @@ pub struct WorkerRegistration {
     pub model_name: String,
     pub endpoint: String,
     pub block_size: u32,
-    pub data_parallel_size: u32,
     pub kv_events_endpoints: HashMap<u32, String>,
     pub replay_endpoint: Option<String>,
     pub total_kv_blocks: Option<u64>,
@@ -86,7 +85,6 @@ pub struct OverlapSummary {
 pub struct SelectResponse {
     pub selection_id: Option<String>,
     pub worker_id: u64,
-    pub dp_rank: u32,
     pub endpoint: String,
     pub block_size: u32,
     pub overlap: OverlapSummary,
@@ -114,19 +112,32 @@ impl Selector {
         let kv_router_config = kv_router_config_from_dynamo_env();
         let cancel = CancellationToken::new();
 
+        // `max_num_batched_tokens` is applied uniformly to every worker the EPP
+        // registers, so validate it once here — before worker discovery — when
+        // the router policy needs it. Without this, a missing/zero value only
+        // surfaces later as a confusing "no schedulable workers" at request time.
+        // The selection service still enforces it per worker as defense in depth.
+        if kv_router_config.requires_max_num_batched_tokens()
+            && cfg.max_num_batched_tokens.unwrap_or(0) == 0
+        {
+            anyhow::bail!(
+                "DYN_EPP_MAX_NUM_BATCHED_TOKENS is required (and must be > 0) because the router \
+                 scheduling policy (queue threshold or policy config) is enabled; set it to the \
+                 engine's --max-num-batched-tokens"
+            );
+        }
+
         let mut builder =
             SelectionServiceBuilder::new(kv_router_config).indexer_threads(cfg.selector_threads);
 
-        // Config validation already guarantees peer_sync_port is Some whenever
-        // peer_service is set; resolve the (name, port) pair once and surface the
-        // invariant as an error rather than a panic.
+        // Replication is enabled by peer_service. Resolve the required named
+        // `replica-agg` EndpointSlice port before building the selection service
+        // so both the local bind and peer dialing use the Service contract.
         let replication: Option<(String, u16)> = match &cfg.peer_service {
-            Some(name) => {
-                let port = cfg.peer_sync_port.ok_or_else(|| {
-                    anyhow!("peer_sync_port is required when peer_service is set")
-                })?;
-                Some((name.clone(), port))
-            }
+            Some(name) => Some((
+                name.clone(),
+                crate::peer_discovery::resolve_replica_sync_port(&cfg.namespace, name).await?,
+            )),
             None => None,
         };
 
@@ -189,10 +200,13 @@ impl Selector {
         CoreWorkerRequest {
             worker_id: reg.worker_id,
             model_name: reg.model_name.clone(),
-            tenant_id: DEFAULT_TENANT.to_string(),
+            routing_group: DEFAULT_ROUTING_GROUP.to_string(),
             endpoint: Some(reg.endpoint.clone()),
             block_size: Some(reg.block_size),
-            data_parallel_size: Some(reg.data_parallel_size),
+            // Data parallelism is out of scope for V1: register a single rank.
+            // Multi-rank DP (per-rank KV-event endpoints + dp_rank routing) is a
+            // follow-up; the selection service already supports it.
+            data_parallel_size: Some(1),
             kv_events_endpoints: reg.kv_events_endpoints.clone(),
             replay_endpoint: reg.replay_endpoint.clone(),
             total_kv_blocks: reg.total_kv_blocks,
@@ -243,9 +257,8 @@ impl Selector {
     pub async fn select_and_reserve(&self, req: SelectRequest) -> Result<SelectResponse> {
         let core_req = CoreSelectAndReserveRequest {
             model_name: req.model_name,
-            tenant_id: DEFAULT_TENANT.to_string(),
+            routing_group: DEFAULT_ROUTING_GROUP.to_string(),
             selection_id: req.selection_id,
-            reservation_id: None,
             prompt: PromptRequest {
                 token_ids: Some(req.token_ids),
                 // KV cache-isolation namespace; keeps EPP block hashing aligned
@@ -270,7 +283,6 @@ impl Selector {
         Ok(SelectResponse {
             selection_id: resp.selection_id,
             worker_id: resp.worker_id,
-            dp_rank: resp.dp_rank,
             endpoint: resp.endpoint,
             block_size: resp.block_size,
             overlap: OverlapSummary {
