@@ -235,9 +235,9 @@ mod tests {
     use super::*;
     use crate::common::protocols::EngineType;
 
-    fn args() -> MockEngineArgs {
+    fn args(engine_type: EngineType) -> MockEngineArgs {
         MockEngineArgs::builder()
-            .engine_type(EngineType::Vllm)
+            .engine_type(engine_type)
             .block_size(4)
             .num_gpu_blocks(128)
             .max_num_seqs(Some(8))
@@ -250,67 +250,71 @@ mod tests {
 
     #[tokio::test]
     async fn streams_planned_tokens_to_the_owning_request() {
-        let engine = LiveEngine::start(args(), 0).unwrap();
-        let uuid = Uuid::from_u128(1);
-        let mut request = engine
-            .submit(DirectRequest {
-                tokens: vec![1, 2, 3],
-                max_output_tokens: 3,
-                output_token_ids: Some(vec![41, 42, 43]),
-                uuid: Some(uuid),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        for engine_type in [EngineType::Vllm, EngineType::Sglang] {
+            let engine = LiveEngine::start(args(engine_type), 0).unwrap();
+            let uuid = Uuid::from_u128(1);
+            let mut request = engine
+                .submit(DirectRequest {
+                    tokens: vec![1, 2, 3],
+                    max_output_tokens: 3,
+                    output_token_ids: Some(vec![41, 42, 43]),
+                    uuid: Some(uuid),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
 
-        let mut outputs = Vec::new();
-        while let Some(signal) = request.recv().await {
-            outputs.push((signal.token_id, signal.completed));
-            if signal.completed {
-                break;
+            let mut outputs = Vec::new();
+            while let Some(signal) = request.recv().await {
+                outputs.push((signal.token_id, signal.completed));
+                if signal.completed {
+                    break;
+                }
             }
+            assert_eq!(
+                outputs,
+                vec![(Some(41), false), (Some(42), false), (Some(43), true)]
+            );
+            assert_eq!(engine.active_request_count(), 0);
         }
-        assert_eq!(
-            outputs,
-            vec![(Some(41), false), (Some(42), false), (Some(43), true)]
-        );
-        assert_eq!(engine.active_request_count(), 0);
     }
 
     #[tokio::test]
     async fn dropping_a_stream_releases_scheduler_state() {
-        let mut slow_args = args();
-        slow_args.speedup_ratio = 1.0;
-        let engine = LiveEngine::start(slow_args, 0).unwrap();
-        let request = engine
-            .submit(DirectRequest {
-                tokens: vec![1; 256],
-                max_output_tokens: 10_000,
-                uuid: Some(Uuid::from_u128(2)),
-                ..Default::default()
+        for engine_type in [EngineType::Vllm, EngineType::Sglang] {
+            let mut slow_args = args(engine_type);
+            slow_args.speedup_ratio = 1.0;
+            let engine = LiveEngine::start(slow_args, 0).unwrap();
+            let request = engine
+                .submit(DirectRequest {
+                    tokens: vec![1; 256],
+                    max_output_tokens: 10_000,
+                    uuid: Some(Uuid::from_u128(2)),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            drop(request);
+
+            let mut metrics = engine.metrics_receiver();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let snapshot = metrics.borrow_and_update().clone();
+                    if snapshot.running_requests == 0 && snapshot.waiting_requests == 0 {
+                        break;
+                    }
+                    metrics.changed().await.unwrap();
+                }
             })
             .await
-            .unwrap();
-        drop(request);
-
-        let mut metrics = engine.metrics_receiver();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let snapshot = metrics.borrow_and_update().clone();
-                if snapshot.running_requests == 0 && snapshot.waiting_requests == 0 {
-                    break;
-                }
-                metrics.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("request cancellation should release scheduler state");
-        assert_eq!(engine.active_request_count(), 0);
+            .expect("request cancellation should release scheduler state");
+            assert_eq!(engine.active_request_count(), 0);
+        }
     }
 
     #[tokio::test]
     async fn duplicate_request_id_does_not_replace_the_original_stream() {
-        let engine = LiveEngine::start(args(), 0).unwrap();
+        let engine = LiveEngine::start(args(EngineType::Vllm), 0).unwrap();
         let uuid = Uuid::from_u128(3);
         let original = engine
             .submit(DirectRequest {

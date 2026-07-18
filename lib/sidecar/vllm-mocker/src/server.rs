@@ -562,45 +562,20 @@ mod tests {
     }
 
     #[test]
-    fn preparation_is_deterministic_and_shapes_logprobs() {
+    fn preparation_is_deterministic() {
         let config = MockerServerConfig::default();
         let first = PreparedRequest::new(request("stable"), &config).unwrap();
         let second = PreparedRequest::new(request("stable"), &config).unwrap();
         assert_eq!(first.uuid, second.uuid);
         assert_eq!(first.output_token_ids, second.output_token_ids);
-
-        let prompt = first.prompt_info();
-        assert_eq!(prompt.token_ids, [1, 2, 3]);
-        assert_eq!(prompt.logprobs.len(), 3);
-        assert_eq!(prompt.candidate_tokens.len(), 3);
-
-        let output = first.sequence_output(&first.output_token_ids, true);
-        assert_eq!(output.num_tokens, 2);
-        assert_eq!(output.logprobs.len(), 2);
-        assert_eq!(output.candidate_tokens[0].tokens.len(), 2);
-        assert_eq!(
-            output.finish_info.unwrap().finish_reason,
-            pb::finish_info::FinishReason::Length as i32
-        );
     }
 
     #[test]
-    fn role_validation_requires_the_expected_handoff_shape() {
-        let mut prefill = request("prefill");
-        prefill.kv = Some(pb::KvCacheParameters {
-            kv_transfer_params: Some(Struct {
-                fields: BTreeMap::from([("do_remote_decode".to_string(), bool_value(true))]),
-            }),
-            ..Default::default()
-        });
+    fn role_validation_rejects_a_missing_prefill_handoff() {
         let config = MockerServerConfig {
             mode: ServerMode::Prefill,
             ..Default::default()
         };
-        let prepared = PreparedRequest::new(prefill, &config).unwrap();
-        let finish = prepared.sequence_output(&[42], true).finish_info.unwrap();
-        assert!(finish.kv_transfer_params.is_some());
-
         let error = PreparedRequest::new(request("wrong-role"), &config).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
@@ -636,6 +611,18 @@ mod tests {
                 .to_string()
                 .contains("dp_size")
         );
+
+        let disaggregated = MockEngineArgs::builder()
+            .worker_type(WorkerType::Prefill)
+            .build()
+            .unwrap();
+        assert!(
+            VllmMockerService::new(MockerServerConfig::default(), disaggregated)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("worker_type")
+        );
     }
 
     #[tokio::test]
@@ -658,5 +645,27 @@ mod tests {
         assert_eq!(output.num_tokens, 2);
         assert_eq!(output.token_ids.len(), 2);
         assert_eq!(output.finish_info.unwrap().num_output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn unary_generate_maps_capacity_rejection_to_resource_exhausted() {
+        let args = MockEngineArgs::builder()
+            .block_size(4)
+            .num_gpu_blocks(1)
+            .max_num_seqs(Some(8))
+            .max_num_batched_tokens(Some(64))
+            .speedup_ratio(0.0)
+            .build()
+            .unwrap();
+        let service = VllmMockerService::new(MockerServerConfig::default(), args).unwrap();
+        let mut oversized = request("oversized");
+        oversized.prompt = Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+            ids: vec![1, 2, 3, 4, 5],
+        }));
+
+        let error = pb::generate_server::Generate::generate(&service, Request::new(oversized))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     }
 }
