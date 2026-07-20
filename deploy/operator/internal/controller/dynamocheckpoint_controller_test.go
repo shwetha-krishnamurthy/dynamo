@@ -949,10 +949,26 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 		require.NoError(t, r.Get(ctx, types.NamespacedName{Name: testHash, Namespace: testNamespace}, updated))
 		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseReady, updated.Status.Phase)
 		assert.Equal(t, testHash, updated.Status.CheckpointID)
+		assert.True(t, updated.Status.JobSucceeded)
 		assert.NotNil(t, updated.Status.CreatedAt)
 		cond := meta.FindStatusCondition(updated.Status.Conditions, "JobCompleted")
 		require.NotNil(t, cond)
 		assert.Equal(t, "PodSnapshotAndJobReady", cond.Reason)
+	})
+
+	t.Run("JobComplete before PodSnapshot Ready persists JobSucceeded", func(t *testing.T) {
+		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
+		job := markCheckpointJobComplete(newCheckpointJob(defaultCheckpointJobName))
+		snap := ownedSnapshot(ckpt, "") // not Ready yet
+
+		r := makeCheckpointReconciler(s, ckpt, job, snap, newOwnedPod(podNameFromJob(job.Name), job))
+		_, err := r.handleCreating(ctx, ckpt)
+		require.NoError(t, err)
+
+		updated := &nvidiacomv1alpha1.DynamoCheckpoint{}
+		require.NoError(t, r.Get(ctx, types.NamespacedName{Name: testHash, Namespace: testNamespace}, updated))
+		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseCreating, updated.Status.Phase)
+		assert.True(t, updated.Status.JobSucceeded)
 	})
 
 	t.Run("PodSnapshot Ready without JobComplete stays Creating", func(t *testing.T) {
@@ -1163,15 +1179,15 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 		assert.Equal(t, "checkpoint job was deleted", updated.Status.Message)
 	})
 
-	t.Run("deleted job with Ready snapshot marks checkpoint Ready", func(t *testing.T) {
+	t.Run("deleted job with Ready snapshot and JobSucceeded marks checkpoint Ready", func(t *testing.T) {
 		ckpt := makeCreatingCkpt(testHash, "job-deleted")
+		ckpt.Status.JobSucceeded = true // observed Complete before TTL delete
 		snap := buildPodSnapshot(ckpt, testHash, podNamed("worker-x"))
 		setCheckpointOwner(ckpt, snap)
 		snap.Status.BoundPodSnapshotContentName = ptr.To("podsnapshotcontent-x")
 		meta.SetStatusCondition(&snap.Status.Conditions, metav1.Condition{
 			Type: "Ready", Status: metav1.ConditionTrue, Reason: "Captured", Message: "checkpoint captured",
 		})
-		// Job TTL-reaped after the capture succeeded: the snapshot result must win over JobDeleted.
 		r := makeCheckpointReconciler(s, ckpt, snap)
 
 		_, err := r.handleCreating(ctx, ckpt)
@@ -1181,10 +1197,34 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 		require.NoError(t, r.Get(ctx, types.NamespacedName{Name: testHash, Namespace: testNamespace}, updated))
 		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseReady, updated.Status.Phase)
 		assert.Equal(t, testHash, updated.Status.CheckpointID)
+		assert.True(t, updated.Status.JobSucceeded)
 		cond := meta.FindStatusCondition(updated.Status.Conditions, "JobCompleted")
 		require.NotNil(t, cond)
 		assert.Equal(t, metav1.ConditionTrue, cond.Status)
 		assert.Equal(t, "PodSnapshotAndJobReady", cond.Reason)
+	})
+
+	t.Run("deleted job with Ready snapshot without JobSucceeded transitions to Failed", func(t *testing.T) {
+		// Job may have Failed then been TTL-deleted before we observed it — do not Ready.
+		ckpt := makeCreatingCkpt(testHash, "job-deleted")
+		snap := buildPodSnapshot(ckpt, testHash, podNamed("worker-x"))
+		setCheckpointOwner(ckpt, snap)
+		snap.Status.BoundPodSnapshotContentName = ptr.To("podsnapshotcontent-x")
+		meta.SetStatusCondition(&snap.Status.Conditions, metav1.Condition{
+			Type: "Ready", Status: metav1.ConditionTrue, Reason: "Captured", Message: "checkpoint captured",
+		})
+		r := makeCheckpointReconciler(s, ckpt, snap)
+
+		_, err := r.handleCreating(ctx, ckpt)
+		require.NoError(t, err)
+
+		updated := &nvidiacomv1alpha1.DynamoCheckpoint{}
+		require.NoError(t, r.Get(ctx, types.NamespacedName{Name: testHash, Namespace: testNamespace}, updated))
+		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseFailed, updated.Status.Phase)
+		cond := meta.FindStatusCondition(updated.Status.Conditions, "JobCompleted")
+		require.NotNil(t, cond)
+		assert.Equal(t, "JobDeletedBeforeComplete", cond.Reason)
+		assert.Contains(t, updated.Status.Message, "before JobComplete was observed")
 	})
 
 	t.Run("deleted job with Failed snapshot transitions to Failed", func(t *testing.T) {
