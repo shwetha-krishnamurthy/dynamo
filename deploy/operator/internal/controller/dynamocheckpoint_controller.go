@@ -426,8 +426,8 @@ func (r *CheckpointReconciler) handleCreatingJobGone(ctx context.Context, ckpt *
 
 // observePodSnapshot maps PodSnapshot + Job terminal state onto the DynamoCheckpoint phase.
 // Ready needs a successful bound PodSnapshot and, while the Job still exists, JobComplete
-// (helpers like gms-saver exit after CRIU). JobFailed wins even after PodSnapshot Ready.
-// If the Job is already TTL-reaped, PodSnapshot Ready is enough.
+// (helpers like gms-saver may still be running after capture). JobFailed wins even after
+// PodSnapshot Ready. If the Job is already TTL-reaped, PodSnapshot Ready is enough.
 func (r *CheckpointReconciler) observePodSnapshot(ctx context.Context, ckpt *nvidiacomv1alpha1.DynamoCheckpoint, job *batchv1.Job, snap *nvidiacomv1alpha1.PodSnapshot, checkpointID string) (ctrl.Result, error) {
 	// Failed can land before bind; Ready is only meaningful once bound.
 	if nvidiacomv1alpha1.IsPodSnapshotFailed(snap) {
@@ -437,7 +437,7 @@ func (r *CheckpointReconciler) observePodSnapshot(ctx context.Context, ckpt *nvi
 	podSnapshotReady := snap.Status.BoundPodSnapshotContentName != nil &&
 		nvidiacomv1alpha1.IsPodSnapshotSucceeded(snap)
 
-	// Helper failure must win even if CRIU already succeeded (Owns(&Job) watch).
+	// Helper failure must win even if capture already succeeded (Owns(&Job) watch).
 	if failed, message := checkpointJobFailed(job); failed {
 		return r.failCreating(ctx, ckpt, "JobFailed", message)
 	}

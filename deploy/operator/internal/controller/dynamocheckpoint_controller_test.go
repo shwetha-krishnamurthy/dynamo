@@ -956,7 +956,7 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 	})
 
 	t.Run("PodSnapshot Ready without JobComplete stays Creating", func(t *testing.T) {
-		// CRIU done, helpers (e.g. gms-saver) may still be running.
+		// Capture done; helpers (e.g. gms-saver) may still be running.
 		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
 		job := newCheckpointJob(defaultCheckpointJobName)
 		snap := ownedSnapshot(ckpt, nvidiacomv1alpha1.PodSnapshotConditionReady)
@@ -972,7 +972,7 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 	})
 
 	t.Run("PodSnapshot Ready with JobFailed transitions to Failed", func(t *testing.T) {
-		// Helper crash after CRIU must not promote Ready.
+		// Helper crash after capture must not promote Ready.
 		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
 		job := newCheckpointJob(defaultCheckpointJobName)
 		job.Status.Conditions = []batchv1.JobCondition{{
