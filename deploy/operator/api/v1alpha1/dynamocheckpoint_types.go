@@ -206,11 +206,6 @@ type DynamoCheckpointStatus struct {
 	// +optional
 	PodSnapshotName string `json:"podSnapshotName,omitempty"`
 
-	// JobSucceeded is true once the checkpoint Job was observed Complete. It survives Job TTL
-	// deletion so Ready still requires observed Job success when the Job is already gone.
-	// +optional
-	JobSucceeded bool `json:"jobSucceeded,omitempty"`
-
 	// CreatedAt is the timestamp when the checkpoint became ready
 	// +optional
 	CreatedAt *metav1.Time `json:"createdAt,omitempty"`
