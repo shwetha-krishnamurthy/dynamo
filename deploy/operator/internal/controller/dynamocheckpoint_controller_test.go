@@ -956,8 +956,7 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 	})
 
 	t.Run("PodSnapshot Ready without JobComplete stays Creating", func(t *testing.T) {
-		// GMS race: CRIU dump finished (PodSnapshot Ready) while gms-saver is still writing
-		// tensors. DynamoCheckpoint must not go Ready until the Job completes.
+		// CRIU done, helpers (e.g. gms-saver) may still be running.
 		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
 		job := newCheckpointJob(defaultCheckpointJobName)
 		snap := ownedSnapshot(ckpt, nvidiacomv1alpha1.PodSnapshotConditionReady)
@@ -973,7 +972,7 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 	})
 
 	t.Run("PodSnapshot Ready with JobFailed transitions to Failed", func(t *testing.T) {
-		// Saver/helper crash after CRIU must not promote a partial checkpoint.
+		// Helper crash after CRIU must not promote Ready.
 		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
 		job := newCheckpointJob(defaultCheckpointJobName)
 		job.Status.Conditions = []batchv1.JobCondition{{

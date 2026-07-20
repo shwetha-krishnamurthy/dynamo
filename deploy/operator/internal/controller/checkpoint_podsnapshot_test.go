@@ -55,7 +55,7 @@ func newCheckpointJob(name string) *batchv1.Job {
 	}
 }
 
-// markCheckpointJobComplete stamps JobComplete=True so observePodSnapshot can promote Ready.
+// markCheckpointJobComplete stamps JobComplete=True for Ready promotion tests.
 func markCheckpointJobComplete(job *batchv1.Job) *batchv1.Job {
 	job.Status.Conditions = append(job.Status.Conditions, batchv1.JobCondition{
 		Type:   batchv1.JobComplete,
