@@ -424,29 +424,46 @@ func (r *CheckpointReconciler) handleCreatingJobGone(ctx context.Context, ckpt *
 	return r.observePodSnapshot(ctx, ckpt, nil, snap, checkpointID)
 }
 
-// observePodSnapshot maps the owned PodSnapshot's status (and the Job's failure hang guard) onto the
-// DynamoCheckpoint phase. The snapshot is resolved and owner-confirmed by the
-// caller, so this never re-reads it by name. Completion cascades up from PodSnapshotContent →
-// PodSnapshot → DynamoCheckpoint, so this never reads the Job's terminal annotation. The Job is read
-// only on the non-terminal path (the terminal PodSnapshot result always wins); it may be nil when
-// the Job is already gone (TTL-reaped), in which case the hang guard is skipped.
+// observePodSnapshot maps the owned PodSnapshot's status and the Job's terminal conditions onto the
+// DynamoCheckpoint phase. The snapshot is resolved and owner-confirmed by the caller, so this never
+// re-reads it by name.
+//
+// Ready requires both a successful bound PodSnapshot and (when the Job is still present)
+// JobComplete. PodSnapshot Ready only means the target-container CRIU dump finished; helper
+// containers such as gms-saver exit afterward and are what make the Job Complete. Marking the
+// checkpoint Ready on PodSnapshot alone races GMS save and can admit restore pods before tensors
+// are on disk. JobFailed is honored even after PodSnapshot Ready so a saver/helper failure cannot
+// promote a partial checkpoint. When the Job is already TTL-reaped, PodSnapshot Ready remains the
+// durable success signal (k8s only TTL-deletes finished Jobs).
 func (r *CheckpointReconciler) observePodSnapshot(ctx context.Context, ckpt *nvidiacomv1alpha1.DynamoCheckpoint, job *batchv1.Job, snap *nvidiacomv1alpha1.PodSnapshot, checkpointID string) (ctrl.Result, error) {
 	// A PodSnapshot can fail before it is bound (e.g. the PodSnapshotReconciler rejects the
 	// source pod), so always observe Failed. Ready is only meaningful once bound.
 	if nvidiacomv1alpha1.IsPodSnapshotFailed(snap) {
 		return r.failCreating(ctx, ckpt, "PodSnapshotFailed", podSnapshotConditionMessage(snap, nvidiacomv1alpha1.PodSnapshotConditionFailed))
 	}
-	if snap.Status.BoundPodSnapshotContentName != nil && nvidiacomv1alpha1.IsPodSnapshotSucceeded(snap) {
-		return r.markCheckpointReady(ctx, ckpt, checkpointID, podSnapshotConditionMessage(snap, nvidiacomv1alpha1.PodSnapshotConditionReady))
-	}
 
-	// Non-terminal: a failed Job is the hang guard. k8s enforces ActiveDeadlineSeconds and sets
-	// JobFailed (reason DeadlineExceeded) on expiry, which the Owns(&Job) watch delivers — so this is
-	// watch-driven, no self-requeue.
+	podSnapshotReady := snap.Status.BoundPodSnapshotContentName != nil &&
+		nvidiacomv1alpha1.IsPodSnapshotSucceeded(snap)
+
+	// Helper/saver failure must win even if CRIU already succeeded. k8s enforces
+	// ActiveDeadlineSeconds and sets JobFailed (reason DeadlineExceeded) on expiry, which the
+	// Owns(&Job) watch delivers — so this is watch-driven, no self-requeue.
 	if failed, message := checkpointJobFailed(job); failed {
 		return r.failCreating(ctx, ckpt, "JobFailed", message)
 	}
-	return ctrl.Result{}, nil
+
+	if !podSnapshotReady {
+		return ctrl.Result{}, nil
+	}
+
+	// Job still present: wait for Complete so all containers (including gms-saver) have exited 0.
+	// Owns(&Job) requeues when Complete lands. Non-GMS Jobs complete shortly after dump when main
+	// exits on snapshot-complete — same condition, no GMS special case.
+	if job != nil && !checkpointJobComplete(job) {
+		return ctrl.Result{}, nil
+	}
+
+	return r.markCheckpointReady(ctx, ckpt, checkpointID, podSnapshotConditionMessage(snap, nvidiacomv1alpha1.PodSnapshotConditionReady))
 }
 
 // failCreating marks the DynamoCheckpoint Failed with a completion-condition reason.
@@ -464,7 +481,8 @@ func (r *CheckpointReconciler) failCreating(ctx context.Context, ckpt *nvidiacom
 	return ctrl.Result{}, r.Status().Update(ctx, ckpt)
 }
 
-// markCheckpointReady marks the DynamoCheckpoint Ready after its bound PodSnapshot succeeded.
+// markCheckpointReady marks the DynamoCheckpoint Ready after its bound PodSnapshot succeeded and
+// (when still observable) the checkpoint Job completed.
 func (r *CheckpointReconciler) markCheckpointReady(ctx context.Context, ckpt *nvidiacomv1alpha1.DynamoCheckpoint, checkpointID, message string) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("Checkpoint ready", "checkpointID", checkpointID)
 	r.Recorder.Event(ckpt, corev1.EventTypeNormal, "CheckpointReady", message)
@@ -475,7 +493,7 @@ func (r *CheckpointReconciler) markCheckpointReady(ctx context.Context, ckpt *nv
 	meta.SetStatusCondition(&ckpt.Status.Conditions, metav1.Condition{
 		Type:    string(nvidiacomv1alpha1.DynamoCheckpointConditionJobCompleted),
 		Status:  metav1.ConditionTrue,
-		Reason:  "PodSnapshotReady",
+		Reason:  "PodSnapshotAndJobReady",
 		Message: message,
 	})
 	return ctrl.Result{}, r.Status().Update(ctx, ckpt)
@@ -505,6 +523,19 @@ func checkpointJobFailed(job *batchv1.Job) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// checkpointJobComplete reports whether the Job has a True JobComplete condition.
+func checkpointJobComplete(job *batchv1.Job) bool {
+	if job == nil {
+		return false
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 //nolint:gocyclo

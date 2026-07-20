@@ -935,9 +935,9 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 		return snap
 	}
 
-	t.Run("PodSnapshot Ready transitions checkpoint to Ready", func(t *testing.T) {
+	t.Run("PodSnapshot Ready with JobComplete transitions checkpoint to Ready", func(t *testing.T) {
 		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
-		job := newCheckpointJob(defaultCheckpointJobName)
+		job := markCheckpointJobComplete(newCheckpointJob(defaultCheckpointJobName))
 		snap := ownedSnapshot(ckpt, nvidiacomv1alpha1.PodSnapshotConditionReady)
 
 		r := makeCheckpointReconciler(s, ckpt, job, snap, newOwnedPod(podNameFromJob(job.Name), job))
@@ -950,6 +950,47 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseReady, updated.Status.Phase)
 		assert.Equal(t, testHash, updated.Status.CheckpointID)
 		assert.NotNil(t, updated.Status.CreatedAt)
+		cond := meta.FindStatusCondition(updated.Status.Conditions, "JobCompleted")
+		require.NotNil(t, cond)
+		assert.Equal(t, "PodSnapshotAndJobReady", cond.Reason)
+	})
+
+	t.Run("PodSnapshot Ready without JobComplete stays Creating", func(t *testing.T) {
+		// GMS race: CRIU dump finished (PodSnapshot Ready) while gms-saver is still writing
+		// tensors. DynamoCheckpoint must not go Ready until the Job completes.
+		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
+		job := newCheckpointJob(defaultCheckpointJobName)
+		snap := ownedSnapshot(ckpt, nvidiacomv1alpha1.PodSnapshotConditionReady)
+
+		r := makeCheckpointReconciler(s, ckpt, job, snap, newOwnedPod(podNameFromJob(job.Name), job))
+		result, err := r.handleCreating(ctx, ckpt)
+		require.NoError(t, err)
+		assert.Zero(t, result)
+
+		updated := &nvidiacomv1alpha1.DynamoCheckpoint{}
+		require.NoError(t, r.Get(ctx, types.NamespacedName{Name: testHash, Namespace: testNamespace}, updated))
+		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseCreating, updated.Status.Phase)
+	})
+
+	t.Run("PodSnapshot Ready with JobFailed transitions to Failed", func(t *testing.T) {
+		// Saver/helper crash after CRIU must not promote a partial checkpoint.
+		ckpt := makeCreatingCkpt(testHash, defaultCheckpointJobName)
+		job := newCheckpointJob(defaultCheckpointJobName)
+		job.Status.Conditions = []batchv1.JobCondition{{
+			Type:    batchv1.JobFailed,
+			Status:  corev1.ConditionTrue,
+			Message: "gms-saver exited 1",
+		}}
+		snap := ownedSnapshot(ckpt, nvidiacomv1alpha1.PodSnapshotConditionReady)
+
+		r := makeCheckpointReconciler(s, ckpt, job, snap, newOwnedPod(podNameFromJob(job.Name), job))
+		_, err := r.handleCreating(ctx, ckpt)
+		require.NoError(t, err)
+
+		updated := &nvidiacomv1alpha1.DynamoCheckpoint{}
+		require.NoError(t, r.Get(ctx, types.NamespacedName{Name: testHash, Namespace: testNamespace}, updated))
+		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseFailed, updated.Status.Phase)
+		assert.Contains(t, updated.Status.Message, "gms-saver exited 1")
 	})
 
 	t.Run("PodSnapshot Failed transitions checkpoint to Failed", func(t *testing.T) {
@@ -1144,7 +1185,7 @@ func TestCheckpointReconciler_HandleCreating(t *testing.T) {
 		cond := meta.FindStatusCondition(updated.Status.Conditions, "JobCompleted")
 		require.NotNil(t, cond)
 		assert.Equal(t, metav1.ConditionTrue, cond.Status)
-		assert.Equal(t, "PodSnapshotReady", cond.Reason)
+		assert.Equal(t, "PodSnapshotAndJobReady", cond.Reason)
 	})
 
 	t.Run("deleted job with Failed snapshot transitions to Failed", func(t *testing.T) {
