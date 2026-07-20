@@ -35,7 +35,16 @@ cargo run -p dynamo-vllm-sidecar --bin dynamo-vllm-sidecar -- \
 `--extra-engine-args` accepts inline JSON or a JSON file path. The values use
 `MockEngineArgs`; `engine_type=vllm`, `dp_size=1`, and
 `worker_type=aggregated` are required. Use `--seed` to change the deterministic
-synthetic token stream.
+synthetic token stream. `--max-concurrent-requests` bounds admitted RPCs
+(default `256`) independently of the scheduler's `max_num_seqs`, so accepted
+requests can still exercise Mocker queueing.
+
+Live response streams share a bounded budget of 32,768 output signals. Each
+RPC reserves its declared `max_new_tokens` before scheduler admission and
+releases that reservation when its response stream is drained or dropped. This
+keeps slow readers memory-bounded without blocking delivery to other admitted
+streams; a request declaring the full 32,768-token limit intentionally holds
+the entire response budget until its stream is released.
 
 ## Disaggregated wire-flow
 
@@ -76,6 +85,8 @@ Dynamo handoff wire-flow only.
 - One output sequence (`n <= 1`).
 - Length termination only; stop strings, EOS, and structured decoding are
   accepted on the wire but are not simulated.
+- Prefix-cache bypass and cache-salt controls are rejected because the Mocker
+  server does not emulate their isolation semantics.
 - One Mocker data-parallel rank per server process.
 
 The server cancels request-ID scheduler work when a gRPC response stream is

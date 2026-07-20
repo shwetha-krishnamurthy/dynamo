@@ -13,10 +13,10 @@ pub mod vllm;
 pub use crate::common::protocols::ForwardPassSnapshot;
 use crate::common::protocols::{DirectRequest, FpmPublisher, KvEventPublishers, OutputSignal};
 use dynamo_kv_router::protocols::RouterEvent;
-pub(crate) use kv_event_sink::{
-    CapturedRouterEventBuffer, capture_deferred_kv_publish_sink, capture_router_event_sink,
+pub(crate) use kv_event_sink::{CapturedRouterEventBuffer, capture_router_event_sink};
+pub(crate) use live_boundary::{
+    LiveBoundaryCore, LivePassExecution, LiveSchedulerState, RequestResidency, spawn_live_scheduler,
 };
-pub(crate) use live_boundary::{LiveBoundaryCore, LiveEffectsPublisher};
 pub(crate) use source_holds::{
     ActiveHandoffRequests, DestinationHolds, PendingDestinations, RemovedSource, SourceCompletion,
     SourceHolds,
@@ -411,6 +411,13 @@ impl SchedulerHandle for EngineScheduler {
         }
     }
 
+    fn cancellation_sender(&self) -> mpsc::Sender<SchedulerCancellationEnvelope> {
+        match self {
+            Self::Vllm(scheduler) => scheduler.cancellation_sender(),
+            Self::Sglang(scheduler) => scheduler.cancellation_sender(),
+        }
+    }
+
     fn take_lifecycle_receiver(&mut self) -> Option<mpsc::Receiver<SchedulerLifecycleEvent>> {
         match self {
             Self::Vllm(scheduler) => scheduler.take_lifecycle_receiver(),
@@ -422,6 +429,49 @@ impl SchedulerHandle for EngineScheduler {
 pub struct SchedulerCommandEnvelope {
     pub command: SchedulerCommand,
     pub reply: oneshot::Sender<anyhow::Result<SchedulerCommandEffects>>,
+}
+
+/// Output channel used by a live scheduler.
+///
+/// Existing replay callers use the unbounded variant. Network-facing adapters
+/// use the bounded variant to cap scheduler-to-dispatcher accumulation; each
+/// request route separately caps buffering at its declared output length.
+#[derive(Clone)]
+pub(crate) enum SchedulerOutputSender {
+    Unbounded(mpsc::UnboundedSender<Vec<OutputSignal>>),
+    Bounded(mpsc::Sender<Vec<OutputSignal>>),
+}
+
+impl SchedulerOutputSender {
+    pub(crate) async fn send(&self, signals: Vec<OutputSignal>) -> Result<(), Vec<OutputSignal>> {
+        match self {
+            Self::Unbounded(tx) => tx.send(signals).map_err(|error| error.0),
+            Self::Bounded(tx) => tx.send(signals).await.map_err(|error| error.0),
+        }
+    }
+}
+
+impl From<mpsc::UnboundedSender<Vec<OutputSignal>>> for SchedulerOutputSender {
+    fn from(tx: mpsc::UnboundedSender<Vec<OutputSignal>>) -> Self {
+        Self::Unbounded(tx)
+    }
+}
+
+pub struct SchedulerCancellationEnvelope {
+    pub request_id: Uuid,
+    pub discard_pending_output: bool,
+    pub reply: oneshot::Sender<anyhow::Result<SchedulerCommandEffects>>,
+}
+
+impl From<SchedulerCancellationEnvelope> for SchedulerCommandEnvelope {
+    fn from(cancellation: SchedulerCancellationEnvelope) -> Self {
+        Self {
+            command: SchedulerCommand::CancelRequest {
+                request_id: cancellation.request_id,
+            },
+            reply: cancellation.reply,
+        }
+    }
 }
 
 /// Engine-agnostic scheduler interface.
@@ -440,6 +490,9 @@ pub trait SchedulerHandle: Send + Sync {
 
     /// Bounded ordered channel for request and disaggregated lifecycle commands.
     fn command_sender(&self) -> mpsc::Sender<SchedulerCommandEnvelope>;
+
+    /// Bounded cancellation channel observed even while a modeled pass is running.
+    fn cancellation_sender(&self) -> mpsc::Sender<SchedulerCancellationEnvelope>;
 
     /// Take the single lifecycle-event stream owned by this DP-rank scheduler.
     fn take_lifecycle_receiver(&mut self) -> Option<mpsc::Receiver<SchedulerLifecycleEvent>>;

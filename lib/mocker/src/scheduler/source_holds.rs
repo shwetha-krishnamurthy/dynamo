@@ -15,8 +15,9 @@ pub enum SchedulerCommand {
     Submit(DirectRequest),
     /// Remove an ordinary request from the live scheduler by its stable ID.
     ///
-    /// This is intentionally ordered on the same command channel as submit so
-    /// a dropped network stream cannot race ahead of request admission.
+    /// Live requests use a dedicated cancellation lane. Their owned submit
+    /// task must acknowledge admission before cancellation is enqueued, so a
+    /// dropped network stream cannot race ahead of its own request admission.
     CancelRequest {
         request_id: Uuid,
     },

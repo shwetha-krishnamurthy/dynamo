@@ -32,6 +32,10 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
+    /// Maximum number of admitted RPCs, including requests queued by Mocker.
+    #[arg(long, default_value_t = 256)]
+    max_concurrent_requests: usize,
+
     /// Partial Mocker engine configuration as inline JSON or a JSON file path.
     #[arg(long)]
     extra_engine_args: Option<String>,
@@ -66,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
             model: args.model,
             mode: args.disaggregation_mode,
             seed: args.seed,
+            max_concurrent_requests: args.max_concurrent_requests,
         },
         engine_args,
     )?;
